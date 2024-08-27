@@ -1,0 +1,6 @@
+The maximum sequence length was set to 500.
+The total amount of coding sequences meeting the prerequisites is 24615.
+The largest nucleotide sequence encompasses 1500 nt.
+Accordingly, the largest amino acid sequence encompasses 500 amino acids.
+Keep in mind that the number of tokens, however, is the same, irrespective of whether nucleotides or amino acids are dealt
+with, as one codon and one amino acid are considered as one token, respectively!

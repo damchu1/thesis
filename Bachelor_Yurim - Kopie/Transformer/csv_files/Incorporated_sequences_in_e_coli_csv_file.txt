@@ -1,0 +1,7 @@
+The following 6 genomes were incorporated in the CSV file:
+GCA_000013305.1
+GCA_000014845.1
+GCA_000023665.1
+GCA_000026245.1
+GCA_000027125.1
+GCA_000148365.1
