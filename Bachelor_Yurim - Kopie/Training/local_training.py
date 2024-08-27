@@ -21,7 +21,7 @@ MAX_SEQ_LENGTH = 1000
 # Hence, instead of using the environment variable $HPC_SCRATCH, the
 # full path must be written, i.e. /work/scratch/ja63nuwu
 training_set, validation_set, test_set = train_validate_test_split(
-    path_to_csv=r"C:\Users\dbfla\PycharmProjects\Bachelor_Yurim\Transformer\csv_files\e_coli_aa_nt_seqs.csv",
+    path_to_csv=f"/work/home/yj90zihi/Bachelor_Yurim/Transformer/csv_files/e_coli_aa_nt_seqs.csv",
     train_size=0.8,
     valid_size=0.1
 )
