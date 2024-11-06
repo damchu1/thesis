@@ -55,82 +55,87 @@ class PositionalEmbedding(tf.keras.layers.Layer):
 
 # Base attention class, from which more specific attention layers will be branched off
 class BaseAttention(tf.keras.layers.Layer):
-    def __init__(self,d_model, num_heads, dropout_rate=0.1, **kwargs):
+    def __init__(self, d_model, num_heads, dropout_rate=0.1, **kwargs):
         super().__init__()
         self.attention = LinearAttention(d_model=d_model, num_heads=num_heads)
         self.layernorm = tf.keras.layers.LayerNormalization()
         self.add = tf.keras.layers.Add()
-        #self.dropout = tf.keras.layers.Dropout(dropout_rate)
+        self.dropout = tf.keras.layers.Dropout(dropout_rate)  # Dropout 추가
+        self.supports_masking = True
 
-
-    def call(self, query, key, value):
-        attn_output = self.attention(query=query, key=key, value=value)
-        attn_output = self.dropout(attn_output)
+    def call(self, query, key, value, mask=None):
+        attn_output = self.attention(query=query, key=key, value=value, mask=mask)
+        attn_output = self.dropout(attn_output)  # Dropout 적용
         x = self.add([query, attn_output])
         x = self.layernorm(x)
         return x
 
+def linear_attention(query, key, value, mask):
+    # Apply the feature map transformation (ELU + 1) to enable linearized attention
+    query = tf.nn.elu(query) + 1
+    key = tf.nn.elu(key) + 1
+
+    # Compute key-value sum and query-key normalization term for scaling
+    kv_sum = tf.einsum('bhld,bhmd->bhld', key, value)  # (batch_size, num_heads, depth)
+    query_key_sum = tf.einsum('bhld,bhld->bhl', query, key) + 1e-6  # (batch_size, num_heads, seq_len)
+
+    # Compute the linear attention output
+    output = tf.einsum('bhld,bhl->bhld', kv_sum, query_key_sum)
+
+    # Handle masking if provided
+    if mask is not None:
+        # Expand mask dimensions to align with (batch_size, num_heads, seq_len, depth)
+        mask = tf.cast(mask, dtype=tf.float32)[:, tf.newaxis, :, tf.newaxis]
+        output *= mask
+
+    return output
+
+
 class LinearAttention(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads):
+    def __init__(self, d_model, num_heads, dropout_rate=0.1):
         super(LinearAttention, self).__init__()
         self.d_model = d_model
         self.num_heads = num_heads
+
+        assert d_model % self.num_heads == 0
+
         self.depth = d_model // num_heads
 
         self.query_proj = tf.keras.layers.Dense(d_model)
         self.key_proj = tf.keras.layers.Dense(d_model)
         self.value_proj = tf.keras.layers.Dense(d_model)
+
         self.out_proj = tf.keras.layers.Dense(d_model)
+        self.dropout = tf.keras.layers.Dropout(dropout_rate)
 
     def split_heads(self, x, batch_size):
-        x = tf.reshape(
-            x, (batch_size, -1, self.num_heads, self.depth))
-        return tf.transpose(x, perm=[0, 2, 1, 3])
+        # Splits the last dimension into (num_heads, depth).
+        x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
+        return tf.transpose(x, perm=[0, 2, 1, 3])  # Shape: (batch_size, num_heads, seq_len, depth)
 
-    def linear_attention(self, query, key, value):
-        """
-                Implements linearized attention with feature mapping.
+    def combine_heads(self, x, batch_size):
+        # Combine the heads back into the last dimension.
+        x = tf.transpose(x, perm=[0, 2, 1, 3])  # Shape: (batch_size, seq_len, num_heads, depth)
+        return tf.reshape(x, (batch_size, -1, self.d_model))  # Shape: (batch_size, seq_len, d_model)
 
-                Args:
-                    query: (batch_size, num_heads, seq_len, depth)
-                    key: (batch_size, num_heads, seq_len, depth)
-                    value: (batch_size, num_heads, seq_len, depth)
-
-                Returns:
-                    output: The result of the linear attention mechanism (batch_size, num_heads, seq_len, depth)
-                """
-        # Apply feature mappings to queries and keys using kernel trick
-        query = tf.nn.elu(query) + 1  # Example feature mapping φ(Q)
-        key = tf.nn.elu(key) + 1  # Example feature mapping φ(K)
-
-        # Compute the linearized attention output
-        key_sum = tf.einsum('bhld->bhl', key)  # Summing across the sequence dimension
-        weighted_values = tf.einsum('bhld,bhld->bhl', key, value)  # Weighted sum of values
-
-        # Linear attention mechanism (O(N) complexity)
-        output = tf.einsum('bhld,bhl->bhld', query, weighted_values)
-        norm_factor = 1.0 / (tf.einsum('bhld,bhl->bhld', query, key_sum) + 1e-6)  # Normalization
-
-        return output * norm_factor
-
-    def call(self, query, key, value):
+    def call(self, query, key, value, mask=None):
         batch_size = tf.shape(query)[0]
 
+        # Project inputs to obtain query, key, and value matrices
         query = self.query_proj(query)
         key = self.key_proj(key)
         value = self.value_proj(value)
 
+        # Split heads for multi-head attention
         query = self.split_heads(query, batch_size)
         key = self.split_heads(key, batch_size)
         value = self.split_heads(value, batch_size)
 
-        context = self.linear_attention(query, key, value)
-
-        context = tf.transpose(context, perm=[0, 2, 1, 3])
-        context = tf.reshape(context, (batch_size, -1, self.d_model))
-
-        return self.out_proj(context)
-
+        # Combine heads and project the output
+        output = linear_attention(query,key,value,mask)
+        output = self.combine_heads(output, batch_size)
+        output = self.out_proj(output)
+        return output
 
 
 # Feed forward network occurring in both the encoder and the decoder
@@ -144,6 +149,7 @@ class FeedForward(tf.keras.layers.Layer):
         ])
         self.add = tf.keras.layers.Add()
         self.layer_norm = tf.keras.layers.LayerNormalization()
+        self.supports_masking = True
 
     def call(self, x):
         x = self.add([x, self.seq(x)])
@@ -158,14 +164,15 @@ class EncoderLayer(BaseAttention):
         super().__init__(d_model=d_model, num_heads=num_heads)
         self.self_attention = LinearAttention(
             d_model=d_model,
-            num_heads=num_heads
+            num_heads=num_heads,
+            dropout_rate=dropout_rate
         )
         self.ffn = FeedForward(d_model, dff, dropout_rate)
+        self.supports_masking = True
 
-
-    def call(self, x):
+    def call(self, x, mask=None):
         # Linear attention output
-        attn_output = self.self_attention(query=x, key=x, value=x)
+        attn_output = self.self_attention(query=x, key=x, value=x, mask=mask)
 
         # Add and normalize
         x = self.add([x, attn_output])
@@ -194,8 +201,9 @@ class Encoder(tf.keras.layers.Layer):
             for _ in range(num_layers)
         ]
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
+        self.supports_masking = True
 
-    def call(self, x):
+    def call(self, x, mask=None):
         # `x` is token-IDs shape: (batch, seq_len)
         x = self.pos_embedding(x)  # Shape `(batch_size, seq_len, d_model)`.
 
@@ -203,7 +211,7 @@ class Encoder(tf.keras.layers.Layer):
         x = self.dropout(x)
 
         for i in range(self.num_layers):
-            x = self.enc_layers[i](x)
+            x = self.enc_layers[i](x, mask=mask)
 
         return x  # Shape `(batch_size, seq_len, d_model)`.
 
@@ -216,11 +224,15 @@ class CrossAttention(BaseAttention):
         attn_output = self.attention(
             query=x,
             key=context,
-            value=context
+            value=context,
+            #return_attention_scores = True
         )
+
+        # Cache the attention scores for plotting later.
+        #self.last_attn_scores = attn_scores
+
         x = self.add([x, attn_output])
         x = self.layernorm(x)
-        x = self.dropout(x)
         return x
 
 
@@ -231,10 +243,9 @@ class CausalSelfAttention(BaseAttention):
             query=x,
             value=x,
             key=x,
-            )
+        )
         x = self.add([x, attn_output])
         x = self.layernorm(x)
-        #x = self.dropout(x)
         return x
 
 
@@ -247,22 +258,26 @@ class DecoderLayer(tf.keras.layers.Layer):
                  num_heads,
                  dff,
                  dropout_rate=0.1):
-        super(DecoderLayer,self).__init__()
+        super(DecoderLayer, self).__init__()
         self.causal_self_attention = CausalSelfAttention(
             d_model=d_model,
             num_heads=num_heads,
             dropout_rate=dropout_rate
-            )
+        )
         self.cross_attention = CrossAttention(
             d_model=d_model,
             num_heads=num_heads,
             dropout_rate=dropout_rate
-            )
-        self.ffn = FeedForward(d_model, dff,dropout_rate)
+        )
+        self.ffn = FeedForward(d_model, dff, dropout_rate)
+        self.supports_masking = True
 
     def call(self, x, context):
         x = self.causal_self_attention(x=x)
         x = self.cross_attention(x=x, context=context)
+
+        # Cache the last attention scores for plotting later
+        #self.last_attn_scores = self.cross_attention.last_attn_scores
 
         x = self.ffn(x)
         return x
@@ -283,6 +298,8 @@ class Decoder(tf.keras.layers.Layer):
             DecoderLayer(d_model=d_model, num_heads=num_heads,
                          dff=dff, dropout_rate=dropout_rate)
             for _ in range(num_layers)]
+        self.last_attn_scores = None
+        self.supports_masking = True
 
     def call(self, x, context):
         x = self.pos_embedding(x)  # (batch_size, target_seq_len, d_model)
@@ -290,6 +307,8 @@ class Decoder(tf.keras.layers.Layer):
 
         for i in range(self.num_layers):
             x = self.dec_layers[i](x, context)
+
+        #self.last_attn_scores = self.dec_layers[-1].last_attn_scores
 
         # The shape of x is (batch_size, target_seq_len, d_model).
         return x
